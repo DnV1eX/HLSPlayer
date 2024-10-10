@@ -1,2 +1,8 @@
-// The Swift Programming Language
-// https://docs.swift.org/swift-book
+//
+//  HLSPlayer.swift
+//  HLSPlayer
+//
+//  Created by Alexey Demin on 2024-10-09.
+//
+
+final class HLSPlayer { }
