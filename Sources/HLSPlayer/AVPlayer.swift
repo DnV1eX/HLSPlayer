@@ -201,7 +201,11 @@ final class AVPlayer: NSObject, @preconcurrency Player, @unchecked Sendable {
         }
     }
     
-    func setItem(url: URL) {
+    func setItem(url: URL?) {
+        guard let url else {
+            currentItem = nil
+            return
+        }
         let item = AVPlayerItem(url: url)
         if #available(iOS 14.0, macOS 11.0, *) {
             item.startsOnFirstEligibleVariant = true

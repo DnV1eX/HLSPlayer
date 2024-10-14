@@ -33,7 +33,7 @@ public protocol Player: AnyObject {
     
     var currentItem: Item? { get }
     
-    func setItem(url: URL)
+    func setItem(url: URL?)
     
     var currentTime: TimeInterval { get }
     
@@ -75,10 +75,10 @@ public enum PlayerAction {
 public enum Players {
     
     public static var `default`: any Player {
-        Self.av
+        Self.avPlayer
     }
     
-    public static var av: any Player {
+    public static var avPlayer: any Player {
         AVPlayer()
     }
 }
