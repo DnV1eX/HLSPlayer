@@ -9,26 +9,31 @@ import Foundation
 
 // https://datatracker.ietf.org/doc/html/draft-pantos-hls-rfc8216bis (HTTP Live Streaming 2nd Edition)
 
+// MARK: - Type declarations
+
 enum HLSParsing {
+    
+    nonisolated(unsafe) static var isStrict = false
     
     protocol Playlist {
         typealias Error = HLSParsing.PlaylistError
         typealias Tag = HLSParsing.PlaylistTag
-        typealias Line = Substring
     }
     
     enum PlaylistError: Error {
         case stringUTF8DecodingFailure
-        case extendedM3UTagMissing
+        case unknownTag(String)
         case multipleOccurrenceOfTag(PlaylistTag)
+        case multipleOccurrenceOfTagInSegment(PlaylistTag)
         case unexpectedMediaPlaylistOrSegmentTag(PlaylistTag)
         case unexpectedMultivariantPlaylistTag(PlaylistTag)
         case missingTag(PlaylistTag)
         case wrongTagValueFormat(PlaylistTag, String)
         case missingAttribute(PlaylistTag.Attribute)
         case wrongAttributeFormat(PlaylistTag.Attribute, String)
-        case missingURIForTag(PlaylistTag)
-        case wrongURIFormatForTag(PlaylistTag, String)
+        case missingStreamURI
+        case wrongStreamURIFormat(String)
+        case wrongSegmentURIFormat(String)
     }
     
     enum PlaylistTag: String, CustomStringConvertible, CaseIterable {
@@ -133,8 +138,22 @@ enum HLSParsing {
             }
         }
         
+        static let uniqueTags: [Self] = [.extendedM3U, .version, .independentSegments, .start, .targetDuration, .mediaSequence, .discontinuitySequence, .endlist, .playlistType, .iFramesOnly, .partInfo, .serverControl, .skip, .contentSteering]
+        
+        static let uniqueInSegmentTags: [Self] = [.extendedInfo, .byteRange, .discontinuity, .programDateTime, .gap]
+        
+        static let notImplementedTags: [Self] = [.start, .define, .playlistType, .iFramesOnly, .partInfo, .serverControl, .key, .map, .programDateTime, .gap, .bitrate, .part, .dateRange, .skip, .preloadHint, .renditionReport, .media, .iFrameStreamInfo, .sessionData, .sessionKey, .contentSteering]
+        
+        var isUnique: Bool {
+            Self.uniqueTags.contains(self)
+        }
+        
+        var isUniqueInSegment: Bool {
+            Self.uniqueInSegmentTags.contains(self)
+        }
+        
         var isNotImplemented: Bool {
-            [.start, .define, .playlistType, .iFramesOnly, .partInfo, .serverControl, .extendedInfo, .byteRange, .discontinuity, .key, .map, .programDateTime, .gap, .bitrate, .part, .dateRange, .skip, .preloadHint, .renditionReport, .media, .iFrameStreamInfo, .sessionData, .sessionKey, .contentSteering].contains(self)
+            Self.notImplementedTags.contains(self)
         }
     }
 }
@@ -165,220 +184,11 @@ extension HLSParsing.PlaylistTag {
             }
         }
     }
-    
-    protocol Value {
-        init?(substring: Substring)
-    }
-    
-    struct AttributeList: Value {
-        
-        typealias Error = HLSParsing.PlaylistError
-        typealias Tag = HLSParsing.PlaylistTag
-        
-        private let dictionary: [Attribute: Substring]
-
-        init(substring: Substring) {
-            dictionary = substring.split(separator: ",").reduce(into: [:]) { partialResult, attribute in
-                let pair = attribute.split(separator: "=")
-                // Loose attribute parsing: skip invalid format and unknown names; overwrite duplicate names.
-                guard pair.count == 2, let name = Tag.Attribute(rawValue: String(pair[0])) else { return }
-                partialResult[name] = pair[1]
-            }
-        }
-
-        func value<T: Tag.Attribute.Value>(_ attribute: Tag.Attribute) throws(Error) -> T {
-            guard let attributeValue = dictionary[attribute] else {
-                throw .missingAttribute(attribute)
-            }
-            guard let value = T(substring: attributeValue) else {
-                throw .wrongAttributeFormat(attribute, String(attributeValue))
-            }
-            return value
-        }
-    }
-}
-
-fileprivate extension HLSParsing.Playlist.Line {
-    
-    typealias Error = HLSParsing.PlaylistError
-    typealias Tag = HLSParsing.PlaylistTag
-
-    func value<T: Tag.Value>(for tag: Tag) throws(Error) -> T? {
-        guard hasPrefix(tag.description) else {
-            return nil
-        }
-        let valueSubstring = dropFirst(tag.description.count + 1) // Remove tag with colon.
-        guard let value = T(substring: valueSubstring) else {
-            throw .wrongTagValueFormat(tag, String(valueSubstring))
-        }
-        return value
-    }
-}
-
-fileprivate extension Array where Element == HLSParsing.Playlist.Line {
-    
-    typealias Error = HLSParsing.PlaylistError
-    typealias Tag = HLSParsing.PlaylistTag
-
-    init(data: Data) throws(Error) {
-        guard let string = String(data: data, encoding: .utf8) else {
-            throw .stringUTF8DecodingFailure
-        }
-        
-        let lines = string.split(separator: "\n")
-        guard let firstLine = lines.first, firstLine == Tag.extendedM3U.description else {
-            throw .extendedM3UTagMissing
-        }
-        
-        self = lines
-    }
-    
-    func contains(anyOf tags: [Tag]) -> Tag? {
-        tags.first { tag in
-            contains { line in
-                line.hasPrefix(tag.description)
-            }
-        }
-    }
-    
-    func contains(uniqueTag tag: Tag) throws(Error) -> Bool {
-        var contains = false
-        for line in self where line.hasPrefix(tag.description) {
-            if contains {
-                throw .multipleOccurrenceOfTag(tag)
-            }
-            contains = true
-        }
-        return contains
-    }
-    
-    func value<T: Tag.Value>(for tag: Tag) throws(Error) -> T? {
-        var tagLine: Element?
-        for line in self where line.hasPrefix(tag.description) {
-            if tagLine != nil {
-                throw .multipleOccurrenceOfTag(tag)
-            }
-            tagLine = line
-        }
-        return try tagLine?.value(for: tag)
-    }
-    
-    func value<T: Tag.Value>(for tag: Tag) throws(Error) -> T {
-        guard let value = try value(for: tag) as T? else {
-            throw .missingTag(tag)
-        }
-        return value
-    }
-    
-    func values<T: Tag.Value>(for tag: Tag) throws(Error) -> [T] {
-        try map { line throws(Error) in
-            try line.value(for: tag)
-        }.compactMap { $0 }
-    }
-    
-    func valuesAndURIs<T: Tag.Value>(for tag: Tag) throws(Error) -> [(value: T, uri: URL)] {
-        try enumerated().map { index, line throws(Error) in
-            guard let value = try line.value(for: tag) as T? else {
-                return nil
-            }
-            let uriLineIndex = index + 1
-            guard uriLineIndex < count else {
-                throw .missingURIForTag(tag)
-            }
-            let uriString = String(self[uriLineIndex])
-            guard let uri = URL(string: uriString) else {
-                throw .wrongURIFormatForTag(tag, uriString)
-            }
-            return (value, uri)
-        }.compactMap { $0 }
-    }
-}
-
-extension HLSParsing {
-    
-    struct MultivariantPlaylist: Playlist {
-        
-        let version: Int
-        
-        let independentSegments: Bool
-        
-        let streams: [(bandwidth: Int,
-                       averageBandwidth: Int?,
-                       score: Double?,
-                       codecs: [String],
-                       supplementalCodecs: [String],
-                       resolution: Tag.Attribute.Resolution?,
-                       frameRate: Double?,
-                       uri: URL)]
-        
-        init(data: Data) throws(Playlist.Error) {
-            let lines = try [Line](data: data)
-
-            if let tag = lines.contains(anyOf: Tag.allCases.filter { [.mediaPlaylist, .mediaSegment].contains($0.type) }) {
-                throw .unexpectedMediaPlaylistOrSegmentTag(tag)
-            }
-            
-            version = try lines.value(for: .version) ?? 1
-            
-            independentSegments = try lines.contains(uniqueTag: .independentSegments)
-            
-            let streamInfo = try lines.valuesAndURIs(for: .streamInfo) as [(Tag.AttributeList, URL)]
-            streams = try streamInfo.map { attributeList, uri throws(Playlist.Error) in
-                (bandwidth: try attributeList.value(.bandwidth),
-                 averageBandwidth: try? attributeList.value(.averageBandwidth),
-                 score: try? attributeList.value(.score),
-                 codecs: (try? (attributeList.value(.codecs) as String).split(separator: ",").map(String.init)) ?? [],
-                 supplementalCodecs: (try? (attributeList.value(.supplementalCodecs) as String).split(separator: ",").map(String.init)) ?? [],
-                 resolution: try? attributeList.value(.resolution),
-                 frameRate: try? attributeList.value(.frameRate),
-                 uri: uri)
-            }
-        }
-    }
-    
-    struct MediaPlaylist: Playlist {
-        
-        let version: Int
-        
-        let independentSegments: Bool
-        
-        let targetDuration: Int
-        
-        let mediaSequence: Int?
-        
-        let discontinuitySequence: Int?
-        
-        let endlist: Bool
-        
-        init(data: Data, playlist: MultivariantPlaylist?) throws(Playlist.Error) {
-            let lines = try [Line](data: data)
-
-            if let tag = lines.contains(anyOf: Tag.allCases.filter { $0.type == .multivariantPlaylist }) {
-                throw .unexpectedMultivariantPlaylistTag(tag)
-            }
-            
-            version = try lines.value(for: .version) ?? 1
-
-            independentSegments = try lines.contains(uniqueTag: .independentSegments) || playlist?.independentSegments ?? false
-            
-            targetDuration = try lines.value(for: .targetDuration)
-            
-            mediaSequence = try lines.value(for: .mediaSequence)
-            
-            discontinuitySequence = try lines.value(for: .discontinuitySequence)
-            
-            endlist = try lines.contains(uniqueTag: .endlist)
-        }
-    }
 }
 
 extension HLSParsing.PlaylistTag.Attribute {
     
-    protocol Value: HLSParsing.PlaylistTag.Value {
-        init?(substring: Substring)
-    }
-    
-    struct Resolution: LosslessStringConvertible, Value {
+    struct Resolution: LosslessStringConvertible {
         let width: Int
         let height: Int
         
@@ -395,10 +205,338 @@ extension HLSParsing.PlaylistTag.Attribute {
             self.height = height
         }
     }
+    
+    struct ByteRange: LosslessStringConvertible {
+        let length: Int
+        let offset: Int?
+        
+        var description: String {
+            [length, offset].compactMap(\.self).map(String.init).joined(separator: "@")
+        }
+        
+        init?(_ description: String) {
+            let pair = description.split(separator: "@")
+            guard !pair.isEmpty, let length = Int(pair[0]) else {
+                return nil
+            }
+            self.length = length
+            self.offset = pair.count == 2 ? Int(pair[1]) : nil
+        }
+    }
+}
+
+// MARK: - Parsing playlists
+
+extension HLSParsing {
+    
+    struct MultivariantPlaylist: Playlist {
+        
+        typealias Stream = (bandwidth: Int,
+                            averageBandwidth: Int?,
+                            score: Double?,
+                            codecs: [String],
+                            supplementalCodecs: [String],
+                            resolution: Tag.Attribute.Resolution?,
+                            frameRate: Double?,
+                            uri: URL)
+        
+        let version: Int?
+        let independentSegments: Bool
+        let streams: [Stream]
+        
+        init(data: Data) throws(Playlist.Error) {
+            
+            let lines = try Self.lines(data)
+            // Collects the last substrings for encountered tags.
+            var tagList: Playlist.TagList = [Tag.extendedM3U: ""]
+            var lastTag: Tag?
+            var streams: [Stream] = []
+            
+            for line in lines {
+                if line.hasPrefix("#EXT") {
+                    // Tag.
+                    guard let (tag, substring) = try HLSParsing.throwIfStrict(line.tagAndSubstring) else {
+                        continue // Skip unknown tag.
+                    }
+                    if [.mediaPlaylist, .mediaSegment].contains(tag.type) {
+                        throw .unexpectedMediaPlaylistOrSegmentTag(tag)
+                    }
+                    if tag.isUnique && tagList.keys.contains(tag) {
+                        throw .multipleOccurrenceOfTag(tag)
+                    }
+                    if lastTag == .streamInfo {
+                        throw .missingStreamURI
+                    }
+                    if tag.isNotImplemented {
+                        print("The \(tag.rawValue) tag parsing is not implemented.")
+                    }
+                    tagList[tag] = substring
+                    lastTag = tag
+                }
+                else if line.hasPrefix("#") {
+                    // Comment.
+                    print(line)
+                }
+                else {
+                    // URI.
+                    guard let uri = URL(string: String(line)) else {
+                        try HLSParsing.throwIfStrict(error: .wrongStreamURIFormat(String(line)))
+                        continue // Ignore malformed URIs.
+                    }
+                    let streamInfo: Tag.AttributeList = try tagList.value(.streamInfo)
+                    let stream: Stream = (bandwidth: try streamInfo.value(.bandwidth),
+                                          averageBandwidth: try? streamInfo.value(.averageBandwidth),
+                                          score: try? streamInfo.value(.score),
+                                          codecs: (try? (streamInfo.value(.codecs) as String).split(separator: ",").map(String.init)) ?? [],
+                                          supplementalCodecs: (try? (streamInfo.value(.supplementalCodecs) as String).split(separator: ",").map(String.init)) ?? [],
+                                          resolution: try? streamInfo.value(.resolution),
+                                          frameRate: try? streamInfo.value(.frameRate),
+                                          uri: uri)
+                    streams.append(stream)
+                    
+                    lastTag = nil
+                }
+            }
+            if lastTag == .streamInfo {
+                throw .missingStreamURI
+            }
+            version = try tagList.value(.version)
+            independentSegments = tagList.keys.contains(.independentSegments)
+            self.streams = streams
+        }
+    }
+    
+    struct MediaPlaylist: Playlist {
+        
+        typealias Segment = (duration: Double,
+                             title: String?,
+                             subrange: Tag.Attribute.ByteRange?,
+                             discontinuity: Bool,
+                             uri: URL)
+        
+        let version: Int?
+        let independentSegments: Bool
+        let targetDuration: Int
+        let mediaSequence: Int?
+        let discontinuitySequence: Int?
+        let endlist: Bool
+        let segments: [Segment]
+        
+        init(data: Data, baseURI: URL, multivariantPlaylist: MultivariantPlaylist?) throws(Playlist.Error) {
+            
+            let lines = try Self.lines(data)
+            // Collects the last substrings for encountered tags.
+            var tagList: Playlist.TagList = [Tag.extendedM3U: ""]
+            var segments: [Segment] = []
+            
+            for line in lines {
+                if line.hasPrefix("#EXT") {
+                    // Tag.
+                    guard let (tag, substring) = try HLSParsing.throwIfStrict(line.tagAndSubstring) else {
+                        continue // Skip unknown tag.
+                    }
+                    if tag.type == .multivariantPlaylist {
+                        throw .unexpectedMultivariantPlaylistTag(tag)
+                    }
+                    if tag.isUnique && tagList.keys.contains(tag) {
+                        throw .multipleOccurrenceOfTag(tag)
+                    }
+                    if tag.isUniqueInSegment && tagList.keys.contains(tag) {
+                        try HLSParsing.throwIfStrict(error: .multipleOccurrenceOfTagInSegment(tag))
+                        // Overwrite duplicate segment tag.
+                    }
+                    if tag.isNotImplemented {
+                        print("The \(tag.rawValue) tag parsing is not implemented.")
+                    }
+                    tagList[tag] = substring
+                }
+                else if line.hasPrefix("#") {
+                    // Comment.
+                    print(line)
+                }
+                else {
+                    // URI.
+                    guard let uri = URL(string: String(line)) else {
+                        try HLSParsing.throwIfStrict(error: .wrongSegmentURIFormat(String(line)))
+                        continue // Ignore malformed URIs.
+                    }
+                    let info: Tag.Info = try tagList.value(.extendedInfo)
+                    let segment: Segment = (duration: info.duration,
+                                            title: info.title,
+                                            subrange: try tagList.value(.byteRange),
+                                            discontinuity: tagList.keys.contains(.discontinuity),
+                                            uri: uri)
+                    segments.append(segment)
+                    
+                    for tag in Tag.uniqueInSegmentTags {
+                        tagList.removeValue(forKey: tag)
+                    }
+                }
+            }
+            version = try tagList.value(.version)
+            independentSegments = tagList.keys.contains(.independentSegments) || multivariantPlaylist?.independentSegments ?? false
+            targetDuration = try tagList.value(.targetDuration)
+            mediaSequence = try tagList.value(.mediaSequence)
+            discontinuitySequence = try tagList.value(.discontinuitySequence)
+            endlist = tagList.keys.contains(.endlist)
+            self.segments = segments
+        }
+    }
+}
+
+// MARK: - Fileprivate extensions
+
+extension HLSParsing {
+    
+    fileprivate static func throwIfStrict(error: PlaylistError) throws(PlaylistError) {
+        if isStrict {
+            throw error
+        } else {
+            print(error)
+        }
+    }
+    
+    fileprivate static func throwIfStrict<T>(_ closure: () throws(PlaylistError) -> T) throws(PlaylistError) -> T? {
+        do {
+            return try closure()
+        } catch {
+            try throwIfStrict(error: error)
+            return nil
+        }
+    }
+}
+
+extension HLSParsing.Playlist {
+    
+    fileprivate typealias TagList = [Tag: Substring]
+    fileprivate typealias Line = Substring
+    
+    fileprivate static func lines(_ data: Data) throws(Error) -> [Line] {
+        
+        guard let string = String(data: data, encoding: .utf8) else {
+            throw .stringUTF8DecodingFailure
+        }
+        var lines = string.split(whereSeparator: \.isNewline)
+
+        guard !lines.isEmpty, lines.removeFirst() == Tag.extendedM3U.description else {
+            throw .missingTag(.extendedM3U)
+        }
+        return lines
+    }
+}
+
+extension HLSParsing.Playlist.Line {
+    
+    fileprivate typealias Error = HLSParsing.PlaylistError
+    fileprivate typealias Tag = HLSParsing.PlaylistTag
+    
+    fileprivate func tagAndSubstring() throws(Error) -> (tag: Tag, substring: Substring) {
+        for tag in Tag.allCases {
+            if tag.description == self {
+                return (tag, "")
+            }
+            else if hasPrefix(tag.description + ":") {
+                return (tag, dropFirst(tag.description.count + 1))
+            }
+        }
+        throw .unknownTag(String(self))
+    }
+}
+
+extension HLSParsing.PlaylistTag {
+    
+    fileprivate typealias Error = HLSParsing.PlaylistError
+    
+    fileprivate typealias AttributeList = [Attribute: Substring]
+    
+    fileprivate protocol Value {
+        init?(substring: Substring)
+    }
+    
+    fileprivate struct Info: Value {
+        let duration: Double
+        let title: String?
+        
+        init?(substring: Substring) {
+            let pair = substring.split(separator: ",", maxSplits: 1)
+            guard !pair.isEmpty, let duration = Double(pair[0]) else {
+                return nil
+            }
+            self.duration = duration
+            self.title = pair.count == 2 ? String(pair[1]) : nil
+        }
+    }
+    
+    fileprivate func value<T: Value>(_ substring: Substring) throws(Error) -> T {
+        guard let value = T(substring: substring) else {
+            throw .wrongTagValueFormat(self, String(substring))
+        }
+        return value
+    }
+    
+    fileprivate func value<T: Value>(_ substring: Substring) throws(Error) -> T? {
+        guard let value = T(substring: substring) else {
+            try HLSParsing.throwIfStrict(error: .wrongTagValueFormat(self, String(substring)))
+            return nil
+        }
+        return value
+    }
+}
+
+extension HLSParsing.PlaylistTag.Attribute {
+    
+    fileprivate protocol Value: HLSParsing.PlaylistTag.Value {
+        init?(substring: Substring)
+    }
+}
+
+extension Dictionary {
+    
+    fileprivate typealias Error = HLSParsing.PlaylistError
+    fileprivate typealias Tag = HLSParsing.PlaylistTag
+}
+
+extension HLSParsing.Playlist.TagList {
+    
+    fileprivate func value<T: Tag.Value>(_ tag: Tag) throws(Error) -> T {
+        guard let substring = self[tag] else {
+            throw .missingTag(tag)
+        }
+        return try tag.value(substring)
+    }
+    
+    fileprivate func value<T: Tag.Value>(_ tag: Tag) throws(Error) -> T? {
+        guard let substring = self[tag] else {
+            return nil
+        }
+        return try tag.value(substring)
+    }
+}
+
+extension HLSParsing.PlaylistTag.AttributeList: HLSParsing.PlaylistTag.Value {
+    
+    fileprivate init(substring: Substring) {
+        self = substring.split(separator: ",").reduce(into: [:]) { partialResult, attribute in
+            let pair = attribute.split(separator: "=")
+            // Loose attribute parsing: skip invalid format and unknown names; overwrite duplicate names.
+            guard pair.count == 2, let name = Tag.Attribute(rawValue: String(pair[0])) else { return }
+            partialResult[name] = pair[1]
+        }
+    }
+
+    fileprivate func value<T: Tag.Attribute.Value>(_ attribute: Tag.Attribute) throws(Error) -> T {
+        guard let attributeValue = self[attribute] else {
+            throw .missingAttribute(attribute)
+        }
+        guard let value = T(substring: attributeValue) else {
+            throw .wrongAttributeFormat(attribute, String(attributeValue))
+        }
+        return value
+    }
 }
 
 extension HLSParsing.PlaylistTag.Value where Self: LosslessStringConvertible {
-    init?(substring: Substring) {
+    fileprivate init?(substring: Substring) {
         self.init(String(substring))
     }
 }
@@ -408,13 +546,17 @@ extension Int: HLSParsing.PlaylistTag.Attribute.Value { }
 extension Double: HLSParsing.PlaylistTag.Attribute.Value { }
 
 extension String: HLSParsing.PlaylistTag.Attribute.Value {
-    init?(substring: Substring) {
+    fileprivate init?(substring: Substring) {
         self = substring.trimmingCharacters(in: .init(charactersIn: "\""))
     }
 }
 
 extension Substring: HLSParsing.PlaylistTag.Attribute.Value {
-    init?(substring: Substring) {
+    fileprivate init?(substring: Substring) {
         self = substring
     }
 }
+
+extension HLSParsing.PlaylistTag.Attribute.Resolution: HLSParsing.PlaylistTag.Attribute.Value { }
+
+extension HLSParsing.PlaylistTag.Attribute.ByteRange: HLSParsing.PlaylistTag.Attribute.Value { }
