@@ -29,11 +29,13 @@ enum HLSParsing {
         case unexpectedMultivariantPlaylistTag(PlaylistTag)
         case missingTag(PlaylistTag)
         case wrongTagValueFormat(PlaylistTag, String)
-        case missingAttribute(PlaylistTag.Attribute)
-        case wrongAttributeFormat(PlaylistTag.Attribute, String)
+        case missingAttribute(any PlaylistTag.Attribute)
+        case wrongAttributeFormat(any PlaylistTag.Attribute, String)
         case missingStreamURI
+        case missingSegmentSubrangeOffset
         case wrongStreamURIFormat(String)
         case wrongSegmentURIFormat(String)
+        case wrongURIFormat(String)
     }
     
     enum PlaylistTag: String, CustomStringConvertible, CaseIterable {
@@ -142,7 +144,7 @@ enum HLSParsing {
         
         static let uniqueInSegmentTags: [Self] = [.extendedInfo, .byteRange, .discontinuity, .programDateTime, .gap]
         
-        static let notImplementedTags: [Self] = [.start, .define, .playlistType, .iFramesOnly, .partInfo, .serverControl, .key, .map, .programDateTime, .gap, .bitrate, .part, .dateRange, .skip, .preloadHint, .renditionReport, .media, .iFrameStreamInfo, .sessionData, .sessionKey, .contentSteering]
+        static let notImplementedTags: [Self] = [.start, .define, .playlistType, .iFramesOnly, .partInfo, .serverControl, .key, .programDateTime, .gap, .bitrate, .part, .dateRange, .skip, .preloadHint, .renditionReport, .media, .iFrameStreamInfo, .sessionData, .sessionKey, .contentSteering]
         
         var isUnique: Bool {
             Self.uniqueTags.contains(self)
@@ -159,8 +161,12 @@ enum HLSParsing {
 }
 
 extension HLSParsing.PlaylistTag {
-    enum Attribute: String {
-        // EXT-X-STREAM-INF
+    
+    protocol Attribute: RawRepresentable, Hashable, Sendable where RawValue == String {
+        static var tag: HLSParsing.PlaylistTag { get }
+    }
+    
+    enum StreamInfoAttribute: String, Attribute {
         /// Represents the peak segment bit rate of the Variant Stream.
         case bandwidth = "BANDWIDTH"
         /// Represents the average segment bit rate of the Variant Stream.
@@ -177,16 +183,17 @@ extension HLSParsing.PlaylistTag {
         case frameRate = "FRAME-RATE"
         // HDCP-LEVEL, ALLOWED-CPC, VIDEO-RANGE, REQ-VIDEO-LAYOUT, STABLE-VARIANT-ID, AUDIO, VIDEO, SUBTITLES, CLOSED-CAPTIONS, PATHWAY-ID
         
-        var tag: HLSParsing.PlaylistTag {
-            switch self {
-            case .bandwidth, .averageBandwidth, .score, .codecs, .supplementalCodecs, .resolution, .frameRate:
-                    .streamInfo
-            }
-        }
+        static let tag: HLSParsing.PlaylistTag = .streamInfo
     }
-}
-
-extension HLSParsing.PlaylistTag.Attribute {
+    
+    enum MapAttribute: String, Attribute {
+        /// A URI that identifies a resource that contains the Media Initialization Section.
+        case uri = "URI"
+        /// A byte range into the resource identified by the URI attribute.
+        case byteRange = "BYTERANGE"
+        
+        static let tag: HLSParsing.PlaylistTag = .map
+    }
     
     struct Resolution: LosslessStringConvertible {
         let width: Int
@@ -208,19 +215,32 @@ extension HLSParsing.PlaylistTag.Attribute {
     
     struct ByteRange: LosslessStringConvertible {
         let length: Int
-        let offset: Int?
+        let offset: Int
+        
+        var nextOffset: Int {
+            length + offset
+        }
+        
+        var range: ClosedRange<Data.Index> {
+            .init(uncheckedBounds: (offset, nextOffset - 1))
+        }
+        
+        init(length: Int, offset: Int) {
+            self.length = length
+            self.offset = offset
+        }
         
         var description: String {
-            [length, offset].compactMap(\.self).map(String.init).joined(separator: "@")
+            "\(length)@\(offset)"
         }
         
         init?(_ description: String) {
             let pair = description.split(separator: "@")
-            guard !pair.isEmpty, let length = Int(pair[0]) else {
+            guard pair.count == 2, let length = Int(pair[0]), let offset = Int(pair[1]) else {
                 return nil
             }
             self.length = length
-            self.offset = pair.count == 2 ? Int(pair[1]) : nil
+            self.offset = offset
         }
     }
 }
@@ -236,7 +256,7 @@ extension HLSParsing {
                             score: Double?,
                             codecs: [String],
                             supplementalCodecs: [String],
-                            resolution: Tag.Attribute.Resolution?,
+                            resolution: Tag.Resolution?,
                             frameRate: Double?,
                             uri: URL)
         
@@ -244,7 +264,7 @@ extension HLSParsing {
         let independentSegments: Bool
         let streams: [Stream]
         
-        init(data: Data) throws(Playlist.Error) {
+        init(data: Data, baseURI: URL) throws(Playlist.Error) {
             
             let lines = try Self.lines(data)
             // Collects the last substrings for encountered tags.
@@ -279,19 +299,21 @@ extension HLSParsing {
                 }
                 else {
                     // URI.
-                    guard let uri = URL(string: String(line)) else {
+                    guard let uri = URL(string: String(line), relativeTo: baseURI) else {
                         try HLSParsing.throwIfStrict(error: .wrongStreamURIFormat(String(line)))
                         continue // Ignore malformed URIs.
                     }
-                    let streamInfo: Tag.AttributeList = try tagList.value(.streamInfo)
-                    let stream: Stream = (bandwidth: try streamInfo.value(.bandwidth),
-                                          averageBandwidth: try? streamInfo.value(.averageBandwidth),
-                                          score: try? streamInfo.value(.score),
-                                          codecs: (try? (streamInfo.value(.codecs) as String).split(separator: ",").map(String.init)) ?? [],
-                                          supplementalCodecs: (try? (streamInfo.value(.supplementalCodecs) as String).split(separator: ",").map(String.init)) ?? [],
-                                          resolution: try? streamInfo.value(.resolution),
-                                          frameRate: try? streamInfo.value(.frameRate),
-                                          uri: uri)
+                    let streamInfo: Tag.AttributeList<Tag.StreamInfoAttribute> = try tagList.value(.streamInfo)
+                    
+                    let stream: Stream = (
+                        bandwidth: try streamInfo.value(.bandwidth),
+                        averageBandwidth: try? streamInfo.value(.averageBandwidth),
+                        score: try? streamInfo.value(.score),
+                        codecs: (try? (streamInfo.value(.codecs) as String).split(separator: ",").map(String.init)) ?? [],
+                        supplementalCodecs: (try? (streamInfo.value(.supplementalCodecs) as String).split(separator: ",").map(String.init)) ?? [],
+                        resolution: try? streamInfo.value(.resolution),
+                        frameRate: try? streamInfo.value(.frameRate),
+                        uri: uri)
                     streams.append(stream)
                     
                     lastTag = nil
@@ -310,8 +332,9 @@ extension HLSParsing {
         
         typealias Segment = (duration: Double,
                              title: String?,
-                             subrange: Tag.Attribute.ByteRange?,
+                             subrange: Tag.ByteRange?,
                              discontinuity: Bool,
+                             map: (uri: URL, subrange: Tag.ByteRange?)?,
                              uri: URL)
         
         let version: Int?
@@ -356,16 +379,33 @@ extension HLSParsing {
                 }
                 else {
                     // URI.
-                    guard let uri = URL(string: String(line)) else {
+                    guard let uri = URL(string: String(line), relativeTo: baseURI) else {
                         try HLSParsing.throwIfStrict(error: .wrongSegmentURIFormat(String(line)))
                         continue // Ignore malformed URIs.
                     }
                     let info: Tag.Info = try tagList.value(.extendedInfo)
-                    let segment: Segment = (duration: info.duration,
-                                            title: info.title,
-                                            subrange: try tagList.value(.byteRange),
-                                            discontinuity: tagList.keys.contains(.discontinuity),
-                                            uri: uri)
+                    let subrange: Tag.ByteRangeWithImplicitOffset? = try tagList.value(.byteRange)
+                    let map: Tag.AttributeList<Tag.MapAttribute>? = try tagList.value(.map)
+                    
+                    let segment: Segment = (
+                        duration: info.duration,
+                        title: info.title,
+                        subrange: try subrange.map { subrange throws(Playlist.Error) in
+                            let offset: Int
+                            if let subrangeOffset = subrange.offset {
+                                offset = subrangeOffset
+                            } else if let nextOffset = segments.last?.subrange?.nextOffset, uri == segments.last?.uri {
+                                offset = nextOffset
+                            } else {
+                                throw .missingSegmentSubrangeOffset
+                            }
+                            return Tag.ByteRange(length: subrange.length, offset: offset)
+                        },
+                        discontinuity: tagList.keys.contains(.discontinuity),
+                        map: try map.map { map throws(Playlist.Error) in
+                            try (uri: URL(string: map.value(.uri), relativeTo: baseURI), subrange: map.value(.byteRange))
+                        },
+                        uri: uri)
                     segments.append(segment)
                     
                     for tag in Tag.uniqueInSegmentTags {
@@ -447,8 +487,18 @@ extension HLSParsing.PlaylistTag {
     
     fileprivate typealias Error = HLSParsing.PlaylistError
     
-    fileprivate typealias AttributeList = [Attribute: Substring]
+    fileprivate struct AttributeList<Attribute: HLSParsing.PlaylistTag.Attribute> {
+        let dictionary: [Attribute: Substring]
+    }
     
+    fileprivate protocol AttributeValue: Value {
+        init?(substring: Substring)
+    }
+
+    fileprivate protocol QuotedAttributeValue: AttributeValue {
+        init?(substring: Substring)
+    }
+
     fileprivate protocol Value {
         init?(substring: Substring)
     }
@@ -467,6 +517,20 @@ extension HLSParsing.PlaylistTag {
         }
     }
     
+    struct ByteRangeWithImplicitOffset: Value {
+        let length: Int
+        let offset: Int?
+        
+        init?(substring: Substring) {
+            let pair = substring.split(separator: "@")
+            guard !pair.isEmpty, let length = Int(pair[0]) else {
+                return nil
+            }
+            self.length = length
+            self.offset = pair.count == 2 ? Int(pair[1]) : nil
+        }
+    }
+
     fileprivate func value<T: Value>(_ substring: Substring) throws(Error) -> T {
         guard let value = T(substring: substring) else {
             throw .wrongTagValueFormat(self, String(substring))
@@ -483,21 +547,11 @@ extension HLSParsing.PlaylistTag {
     }
 }
 
-extension HLSParsing.PlaylistTag.Attribute {
-    
-    fileprivate protocol Value: HLSParsing.PlaylistTag.Value {
-        init?(substring: Substring)
-    }
-}
-
-extension Dictionary {
+extension HLSParsing.Playlist.TagList {
     
     fileprivate typealias Error = HLSParsing.PlaylistError
     fileprivate typealias Tag = HLSParsing.PlaylistTag
-}
 
-extension HLSParsing.Playlist.TagList {
-    
     fileprivate func value<T: Tag.Value>(_ tag: Tag) throws(Error) -> T {
         guard let substring = self[tag] else {
             throw .missingTag(tag)
@@ -515,23 +569,59 @@ extension HLSParsing.Playlist.TagList {
 
 extension HLSParsing.PlaylistTag.AttributeList: HLSParsing.PlaylistTag.Value {
     
+    fileprivate typealias Error = HLSParsing.PlaylistError
+    fileprivate typealias Tag = HLSParsing.PlaylistTag
+
     fileprivate init(substring: Substring) {
-        self = substring.split(separator: ",").reduce(into: [:]) { partialResult, attribute in
-            let pair = attribute.split(separator: "=")
-            // Loose attribute parsing: skip invalid format and unknown names; overwrite duplicate names.
-            guard pair.count == 2, let name = Tag.Attribute(rawValue: String(pair[0])) else { return }
-            partialResult[name] = pair[1]
+        dictionary = substring.split(regex: #"[^,]*?".*?"[^,]*|[^,]+"#).reduce(into: [:]) { dictionary, attributeSubstring in
+            let pair = attributeSubstring.split(separator: "=")
+            // Loose attribute parsing.
+            guard pair.count == 2 else {
+                print("Invalid attribute/value pair syntax \"\(attributeSubstring)\" in \(Attribute.tag).")
+                return
+            }
+            let (name, value) = (pair[0], pair[1])
+            guard let attribute = Attribute(rawValue: String(name)) else {
+                print("Unknown attribute \"\(name)\" in \(Attribute.tag).")
+                return
+            }
+            if dictionary.keys.contains(attribute) {
+                print("Duplicate attribute \"\(name)\" in \(Attribute.tag).")
+                // Overwrite duplicate attribute.
+            }
+            dictionary[attribute] = value
         }
     }
-
-    fileprivate func value<T: Tag.Attribute.Value>(_ attribute: Tag.Attribute) throws(Error) -> T {
-        guard let attributeValue = self[attribute] else {
+    
+    fileprivate func value<Value: Tag.AttributeValue>(_ attribute: Attribute) throws(Error) -> Value {
+        guard let attributeValue = dictionary[attribute] else {
             throw .missingAttribute(attribute)
         }
-        guard let value = T(substring: attributeValue) else {
+        guard let value = Value(substring: attributeValue) else {
             throw .wrongAttributeFormat(attribute, String(attributeValue))
         }
         return value
+    }
+}
+
+extension StringProtocol where SubSequence == Substring {
+    fileprivate func split(regex: String) -> [Substring] {
+        var substrings: [Substring] = []
+        var startIndex = self.startIndex
+        while let range = self[startIndex...].range(of: regex, options: .regularExpression) {
+            substrings.append(self[range])
+            startIndex = range.upperBound
+        }
+        return substrings
+    }
+}
+
+extension URL {
+    fileprivate init(string: String, relativeTo url: URL?) throws(HLSParsing.PlaylistError) {
+        guard let url = URL(string: string, relativeTo: url) else {
+            throw .wrongURIFormat(string)
+        }
+        self = url
     }
 }
 
@@ -541,22 +631,24 @@ extension HLSParsing.PlaylistTag.Value where Self: LosslessStringConvertible {
     }
 }
 
-extension Int: HLSParsing.PlaylistTag.Attribute.Value { }
-
-extension Double: HLSParsing.PlaylistTag.Attribute.Value { }
-
-extension String: HLSParsing.PlaylistTag.Attribute.Value {
+extension HLSParsing.PlaylistTag.QuotedAttributeValue where Self: LosslessStringConvertible {
     fileprivate init?(substring: Substring) {
-        self = substring.trimmingCharacters(in: .init(charactersIn: "\""))
+        self.init(substring.trimmingCharacters(in: .init(charactersIn: "\"")))
     }
 }
 
-extension Substring: HLSParsing.PlaylistTag.Attribute.Value {
+extension Int: HLSParsing.PlaylistTag.AttributeValue { }
+
+extension Double: HLSParsing.PlaylistTag.AttributeValue { }
+
+extension String: HLSParsing.PlaylistTag.QuotedAttributeValue { }
+
+extension Substring: HLSParsing.PlaylistTag.AttributeValue {
     fileprivate init?(substring: Substring) {
         self = substring
     }
 }
 
-extension HLSParsing.PlaylistTag.Attribute.Resolution: HLSParsing.PlaylistTag.Attribute.Value { }
+extension HLSParsing.PlaylistTag.Resolution: HLSParsing.PlaylistTag.AttributeValue { }
 
-extension HLSParsing.PlaylistTag.Attribute.ByteRange: HLSParsing.PlaylistTag.Attribute.Value { }
+extension HLSParsing.PlaylistTag.ByteRange: HLSParsing.PlaylistTag.QuotedAttributeValue { }
