@@ -11,8 +11,9 @@ public protocol Player: AnyObject {
     
     typealias Action = PlayerAction
     associatedtype Item: PlayerItem
+    associatedtype Layer: CALayer
     
-    var layer: CALayer { get }
+    var layer: Layer { get }
 
     /// A default rate at which to begin playback.
     var defaultRate: Double { get set }
@@ -75,10 +76,14 @@ public enum PlayerAction {
 public enum Players {
     
     public static var `default`: any Player {
-        Self.avPlayer
+        Self.hlsPlayer
     }
     
     public static var avPlayer: any Player {
         AVPlayer()
+    }
+    
+    public static var hlsPlayer: any Player {
+        HLSPlayer()
     }
 }
