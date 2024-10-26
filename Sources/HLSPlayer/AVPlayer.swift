@@ -242,4 +242,8 @@ final class AVPlayer: NSObject, @preconcurrency Player, @unchecked Sendable {
     }
 }
 
-extension AVPlayerItem: PlayerItem { }
+extension AVPlayerItem: @preconcurrency PlayerItem {
+    public var duration: TimeInterval {
+        0
+    }
+}

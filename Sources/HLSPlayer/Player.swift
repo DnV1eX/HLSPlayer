@@ -67,6 +67,8 @@ public protocol PlayerItem: AnyObject {
     var preferredPeakBitRate: Double { get set }
     
     var presentationSize: CGSize { get }
+    
+    var duration: TimeInterval { get }
 }
 
 public enum PlayerAction {

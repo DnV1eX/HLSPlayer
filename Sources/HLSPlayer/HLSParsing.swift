@@ -330,7 +330,7 @@ extension HLSParsing {
     
     struct MediaPlaylist: Playlist {
         
-        typealias Segment = (duration: Double,
+        typealias Segment = (duration: TimeInterval,
                              title: String?,
                              subrange: Tag.ByteRange?,
                              discontinuity: Bool,

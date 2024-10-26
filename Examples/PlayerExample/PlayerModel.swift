@@ -19,13 +19,26 @@ import HLSPlayer
     }
     
     var isPlaying = false
-    
     var isBuffering = false
+    var isSeeking = false
 
+    var time: TimeInterval = 0
+    var duration: TimeInterval = 0
+    var speed: Double = 1 {
+        didSet {
+            player.rate = speed
+        }
+    }
+        
     init() {
         player.onChangeStatus = { [weak self, unowned player] in
-            self?.isPlaying = player.isPlaying
-            self?.isBuffering = player.isBuffering
+            guard let self else { return }
+            isPlaying = player.isPlaying
+            isBuffering = player.isBuffering
+            if !isSeeking {
+                time = player.currentTime
+            }
+            duration = player.currentItem?.duration ?? 0
         }
     }
 }
