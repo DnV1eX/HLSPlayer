@@ -416,7 +416,7 @@ extension HLSPlayer {
                         }
                         dispatchGroup.leave()
                     }
-                    dispatchGroup.wait(timeout: .now() + 5)
+                    _ = dispatchGroup.wait(timeout: .now() + 5)
                 }
             }
         }
