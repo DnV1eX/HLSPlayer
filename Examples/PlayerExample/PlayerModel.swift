@@ -26,10 +26,25 @@ import HLSPlayer
     var duration: TimeInterval = 0
     var speed: Double = 1 {
         didSet {
-            player.rate = speed
+            player.defaultRate = speed
         }
     }
-        
+    var preferredBitRate: Int = 0 {
+        didSet {
+            player.currentItem?.preferredPeakBitRate = Double(preferredBitRate)
+        }
+    }
+    var bitRate: Int = 0
+    let bi = 1024
+    var bitRateDescription: String {
+        switch bitRate {
+        case ..<bi: "\(bitRate) bps"
+        case ..<(bi * bi): "\(bitRate / bi) Kbps"
+        case ..<(bi * bi * bi): "\(bitRate / bi / bi) Mbps"
+        default: "\(bitRate / bi / bi / bi) Gbps"
+        }
+    }
+    
     init() {
         player.onChangeStatus = { [weak self, unowned player] in
             guard let self else { return }
@@ -39,6 +54,7 @@ import HLSPlayer
                 time = player.currentTime
             }
             duration = player.currentItem?.duration ?? 0
+            bitRate = (player.currentItem?.bitRate).map(Int.init) ?? 0
         }
     }
 }

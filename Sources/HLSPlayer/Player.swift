@@ -65,10 +65,12 @@ public extension Player {
 public protocol PlayerItem: AnyObject {
         
     var preferredPeakBitRate: Double { get set }
-    
+
     var presentationSize: CGSize { get }
     
     var duration: TimeInterval { get }
+    
+    var bitRate: Double { get }
 }
 
 public enum PlayerAction {

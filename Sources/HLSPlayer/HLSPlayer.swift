@@ -11,12 +11,18 @@ final class HLSPlayer: Player, @unchecked Sendable {
     
     let layer: AVSampleBufferDisplayLayer = .init()
     
-    var defaultRate: Double = 1
-    
-    var rate: Double = 0 {
+    var defaultRate: Double = 1 {
         didSet {
-            CMTimebaseSetRate(timebase, rate: rate)
+            if rate != .zero {
+                rate = defaultRate
+            }
+        }
+    }
+    
+    var rate: Double = .zero {
+        didSet {
             if rate != oldValue {
+                CMTimebaseSetRate(timebase, rate: rate)
                 onChangeStatus?()
             }
         }
@@ -25,6 +31,7 @@ final class HLSPlayer: Player, @unchecked Sendable {
     private(set) var isBuffering: Bool = false {
         didSet {
             if isBuffering != oldValue {
+                CMTimebaseSetRate(timebase, rate: isBuffering ? .zero : rate)
                 onChangeStatus?()
             }
         }
@@ -50,7 +57,7 @@ final class HLSPlayer: Player, @unchecked Sendable {
             return
         }
         
-        let playerItem = HLSPlayer.Item(url: url, bitRate: Int(4e6)) { [weak self] playerItem in
+        let playerItem = HLSPlayer.Item(url: url) { [weak self] playerItem in
             guard let self else { return }
             startTime = playerItem.timestampOffset
         }
@@ -105,7 +112,16 @@ final class HLSPlayer: Player, @unchecked Sendable {
             
             currentItem.playerTime = currentTime
             guard currentItem.duration == 0 || currentTime < currentItem.duration else {
-                pause()
+                switch actionAtItemEnd {
+                case .advance:
+                    seek(to: 0)
+                case .pause:
+                    seek(to: 0)
+                    pause()
+                case .none:
+                    pause()
+                }
+                itemDidPlayToEndTime?()
                 return
             }
             onChangeStatus?()
@@ -153,7 +169,7 @@ extension HLSPlayer {
     
     final class Item: PlayerItem, @unchecked Sendable {
         
-        enum State: Equatable {
+        enum State: String, CustomStringConvertible {
             case loading
             case waiting
             case finished
@@ -165,54 +181,43 @@ extension HLSPlayer {
                 Self.lastError = error
                 return .error
             }
-        }
-        
-        var preferredPeakBitRate: Double = 0
-        
-        var presentationSize: CGSize = .zero
-        
-        let url: URL
-        
-        @Atomic var bitRate: Int {
-            didSet {
-                updateSegments()
+            
+            var description: String {
+                "HLSPlayer item state: \(rawValue)" + (Self.lastError.map { self == .error ? " (\($0))" : "" } ?? "")
             }
         }
         
-        @Atomic var playerTime: TimeInterval = 0
+        @Atomic private(set) var state: State = .loading {
+            didSet {
+                print(state)
+            }
+        }
+
+        @Atomic var preferredPeakBitRate: Double = 0 {
+            didSet {
+                selectStream()
+            }
+        }
         
-        let onUpdate: (HLSPlayer.Item) -> Void
+        private(set) var presentationSize: CGSize = .zero
+                
+        @Atomic private(set) var duration: TimeInterval = 0 {
+            didSet {
+                onUpdate(self)
+            }
+        }
+        
+        var bitRate: Double {
+            (currentStream?.bandwidth).map(Double.init) ?? 0
+        }
+        
+        @Atomic var playerTime: TimeInterval = 0
         
         @Atomic private(set) var timestampOffset: TimeInterval = 0 {
             didSet {
                 onUpdate(self)
             }
         }
-        
-        @Atomic private(set) var duration: TimeInterval = 0 {
-            didSet {
-                onUpdate(self)
-            }
-        }
-
-        @Atomic private var multivariantPlaylist: HLSParsing.MultivariantPlaylist?
-        
-        // Ordered by bandwidth.
-        @Atomic var streams: [HLSParsing.MultivariantPlaylist.Stream] = [] {
-            didSet {
-                updateSegments()
-            }
-        }
-        
-        // Ordered by timestamp.
-        @Atomic var segments: [(timestamp: TimeInterval, segment: HLSParsing.MediaPlaylist.Segment)] = [] {
-            didSet {
-                flush()
-            }
-        }
-        
-        // Cache.
-        @Atomic var segmentMaps: [URL: Data] = [:]
         
         func nextSampleBuffer() -> CMSampleBuffer? {
             guard let (timestamp, sampleBuffer) = sampleBufferQueue.popLast() else {
@@ -232,19 +237,25 @@ extension HLSPlayer {
 
         @Atomic private var sampleBufferQueue: [(timestamp: TimeInterval, sampleBuffer: CMSampleBuffer)] = []
         
-        func loadingSegmentOrEnqueuingSampleBuffer(with timestamp: TimeInterval) -> Bool {
+        private func loadingSegmentOrEnqueuingSampleBuffer(with timestamp: TimeInterval) -> Bool {
             loadingSegmentTimestamps.contains(timestamp) || sampleBufferQueue.lazy.map(\.timestamp).contains(timestamp)
         }
         
-        @Atomic var state: State = .loading {
+        let url: URL
+        
+        let onUpdate: (HLSPlayer.Item) -> Void
+        
+        @Atomic private var multivariantPlaylist: HLSParsing.MultivariantPlaylist?
+        
+        // Ordered by bandwidth.
+        @Atomic private var streams: [HLSParsing.MultivariantPlaylist.Stream] = [] {
             didSet {
-                print(state, State.lastError)
+                selectStream()
             }
         }
         
-        init(url: URL, bitRate: Int, onUpdate: @escaping (HLSPlayer.Item) -> Void) {
+        init(url: URL, onUpdate: @escaping (HLSPlayer.Item) -> Void) {
             self.url = url
-            self.bitRate = bitRate
             self.onUpdate = onUpdate
             
             Self.loadMultivariantPlaylist(url: url) { [self] result in
@@ -258,12 +269,37 @@ extension HLSPlayer {
             }
         }
         
-        func updateSegments() {
-            guard let stream = streams.last { $0.bandwidth < bitRate } ?? streams.first else {
+        @Atomic private var currentStream: HLSParsing.MultivariantPlaylist.Stream? {
+            didSet {
+                if currentStream?.bandwidth != oldValue?.bandwidth {
+                    onUpdate(self)
+                    updateSegments()
+                }
+            }
+        }
+        
+        func selectStream() {
+            let bandwidth = Int(preferredPeakBitRate > 0 ? preferredPeakBitRate : bandwidth)
+            guard let stream = streams.last(where: { $0.bandwidth < bandwidth }) ?? streams.first else {
                 state = .error(HLSPlayerError.streamsMissing)
                 return
             }
-            Self.loadMediaPlaylist(url: stream.uri, multivariantPlaylist: multivariantPlaylist) { [self] result in
+            currentStream = stream
+        }
+        
+        // Ordered by timestamp.
+        @Atomic var segments: [(timestamp: TimeInterval, segment: HLSParsing.MediaPlaylist.Segment)] = [] {
+            didSet {
+                flush()
+            }
+        }
+        
+        func updateSegments() {
+            guard let currentStream else {
+                state = .error(HLSPlayerError.streamsMissing)
+                return
+            }
+            Self.loadMediaPlaylist(url: currentStream.uri, multivariantPlaylist: multivariantPlaylist) { [self] result in
                 switch result {
                 case .success(let mediaPlaylist):
                     segments = mediaPlaylist.segments.reduce(into: []) { array, segment in
@@ -281,7 +317,7 @@ extension HLSPlayer {
             
             guard state != .error else { return }
             
-            guard sampleBufferQueue.count + loadingSegmentTimestamps.count < 6 else { return }
+            guard sampleBufferQueue.count + loadingSegmentTimestamps.count < 4 else { return }
             
             guard let (timestamp, segment) = segments.first(where: { $0.timestamp >= playerTime && !loadingSegmentOrEnqueuingSampleBuffer(with: $0.timestamp) }) else {
                 if state != .loading {
@@ -307,7 +343,7 @@ extension HLSPlayer {
                 updateSampleBuffers()
             }
         }
-        
+                
         static func loadMultivariantPlaylist(url: URL, completionHandler: @escaping @Sendable (Result<HLSParsing.MultivariantPlaylist, Error>) -> Void) {
             URLSession.shared.dataTask(with: url) { data, response, error in
                 guard let data else {
@@ -359,18 +395,28 @@ extension HLSPlayer {
             }.resume()
         }
         
+        let segmentMapDispatchQueue = DispatchQueue(label: "SegmentMapDispatchQueue")
+        
+        var segmentMapCache: [URL: Data] = [:]
+
         func segmentMap(url: URL, range: ClosedRange<Data.Index>?, completionHandler: @escaping @Sendable (Result<Data, Error>) -> Void) {
-            if let segmentMap = segmentMaps[url] {
-                completionHandler(.success(segmentMap))
-            } else {
-                Self.loadMediaSegment(url: url, range: range) { result in
-                    switch result {
-                    case .success(let data):
-                        self.segmentMaps[url] = data
-                        completionHandler(.success(data))
-                    case .failure(let error):
-                        completionHandler(.failure(error))
+            segmentMapDispatchQueue.async { [self] in
+                if let segmentMap = segmentMapCache[url] {
+                    completionHandler(.success(segmentMap))
+                } else {
+                    let dispatchGroup = DispatchGroup()
+                    dispatchGroup.enter()
+                    Self.loadMediaSegment(url: url, range: range) { [self] result in
+                        switch result {
+                        case .success(let data):
+                            segmentMapCache[url] = data
+                            completionHandler(.success(data))
+                        case .failure(let error):
+                            completionHandler(.failure(error))
+                        }
+                        dispatchGroup.leave()
                     }
+                    dispatchGroup.wait(timeout: .now() + 5)
                 }
             }
         }
@@ -389,7 +435,7 @@ extension HLSPlayer {
 
             let idx = data.startIndex
             let naluLengthSize = Int32(data[idx + 4] & 3) + 1
-            var parameterSetPointers: [[UInt8]] = []
+            var parameterSets: [Data] = []
             let spsCount = data[idx + 5] & 5
             var spsSizes: [Int] = []
             var ptr = idx + 6
@@ -399,7 +445,7 @@ extension HLSPlayer {
                 guard ptr + spsSize <= data.endIndex else { break }
                 spsSizes.append(spsSize)
                 let sps = data[ptr ..< ptr + spsSize]
-                parameterSetPointers.append(sps.bytes())
+                parameterSets.append(sps)
                 ptr += spsSize
             }
             let ppsCount = data[ptr]
@@ -411,14 +457,15 @@ extension HLSPlayer {
                 guard ptr + ppsSize <= data.endIndex else { break }
                 ppsSizes.append(ppsSize)
                 let pps = data[ptr ..< ptr + ppsSize]
-                parameterSetPointers.append(pps.bytes())
+                parameterSets.append(pps)
                 ptr += ppsSize
             }
+            let parameterSetPointers = parameterSets.compactMap { UnsafeBufferPointer($0.copyBytesToPointer()).baseAddress }
             let parameterSetSizes = spsSizes + ppsSizes
             var formatDescription: CMFormatDescription?
             let status = CMVideoFormatDescriptionCreateFromH264ParameterSets(allocator: nil,
                                                                              parameterSetCount: parameterSetPointers.count,
-                                                                             parameterSetPointers: parameterSetPointers.map { UnsafePointer<UInt8>($0) },
+                                                                             parameterSetPointers: parameterSetPointers,
                                                                              parameterSetSizes: parameterSetSizes,
                                                                              nalUnitHeaderLength: naluLengthSize,
                                                                              formatDescriptionOut: &formatDescription)
@@ -442,7 +489,7 @@ extension HLSPlayer {
             let atoms = data.atoms()
             for (name, data) in atoms {
                 var defaultSampleDuration = 0
-                var defaultSampleSize = 0
+//                var defaultSampleSize = 0
                 var baseMediaDecodeTime = 0
                 
                 switch name {
@@ -454,9 +501,9 @@ extension HLSPlayer {
                         let idx = data.startIndex
                         
                         switch name {
-                        case "tfhd" where data.count >= 16:
+                        case "tfhd" where data.count >= 12:
                             defaultSampleDuration = Int(data: data[idx + 8 ..< idx + 12])
-                            defaultSampleSize = Int(data: data[idx + 12 ..< idx + 16])
+//                            defaultSampleSize = Int(data: data[idx + 12 ..< idx + 16])
 
                         case "tfdt" where data.count >= 12:
                             baseMediaDecodeTime = Int(data: data[idx + 8 ..< idx + 12])
@@ -497,8 +544,7 @@ extension HLSPlayer {
                     break
                 }
             }
-            let memoryBlock = UnsafeMutableBufferPointer<UInt8>.allocate(capacity: fragmentsData.count)
-            fragmentsData.copyBytes(to: memoryBlock)
+            let memoryBlock = fragmentsData.copyBytesToPointer()
             
             let status = CMBlockBufferCreateWithMemoryBlock(allocator: nil,
                                                             memoryBlock: memoryBlock.baseAddress,
@@ -534,28 +580,49 @@ extension HLSPlayer {
             return sampleBuffer
         }
         
+        let segmentDataDispatchQueue = DispatchQueue(label: "SegmentDataDispatchQueue")
+        
+        @Atomic private var bandwidth: Double = 0 {
+            didSet {
+                selectStream()
+                print("HLSPlayer item bandwidth: \(bandwidth)")
+            }
+        }
+        
         func makeSampleBuffer(segment: HLSParsing.MediaPlaylist.Segment, completionHandler: @escaping @Sendable (Result<CMSampleBuffer, Error>) -> Void) {
             guard let segmentMap = segment.map else {
                 completionHandler(.failure(HLSPlayerError.segmentMapMissing))
                 return
             }
             
-            self.segmentMap(url: segmentMap.uri, range: segmentMap.subrange?.range) { result in
+            self.segmentMap(url: segmentMap.uri, range: segmentMap.subrange?.range) { [self] result in
                 switch result {
                 case .success(let data):
                     do {
                         let (formatDescription, timeScale) = try Self.formatDescription(data: data)
-                        
-                        Self.loadMediaSegment(url: segment.uri, range: segment.subrange?.range) { result in
+                        segmentDataDispatchQueue.async { [self] in
+                            let dispatchGroup = DispatchGroup()
+                            dispatchGroup.enter()
+                            let startTime = DispatchTime.now()
+                            Self.loadMediaSegment(url: segment.uri, range: segment.subrange?.range) { [self] result in
+                                dispatchGroup.leave()
+                                switch result {
+                                case .success(let data):
+                                    let endTime = DispatchTime.now()
+                                    bandwidth = Double(data.count * 8) / Double(endTime.uptimeNanoseconds - startTime.uptimeNanoseconds) * 1e9
+                                    completionHandler(Result(catching: {
+                                        let (blockBuffer, sampleTimings, sampleSizes) = try Self.blockBuffer(data: data, timeScale: timeScale)
+                                        
+                                        return try Self.sampleBuffer(blockBuffer: blockBuffer, formatDescription: formatDescription, sampleTimings: sampleTimings, sampleSizes: sampleSizes)
+                                    }))
+                                case .failure(let error):
+                                    completionHandler(.failure(error))
+                                }
+                            }
+                            let result = dispatchGroup.wait(timeout: .now() + 5)
                             switch result {
-                            case .success(let data):
-                                completionHandler(Result(catching: {
-                                    let (blockBuffer, sampleTimings, sampleSizes) = try Self.blockBuffer(data: data, timeScale: timeScale)
-                                    
-                                    return try Self.sampleBuffer(blockBuffer: blockBuffer, formatDescription: formatDescription, sampleTimings: sampleTimings, sampleSizes: sampleSizes)
-                                }))
-                            case .failure(let error):
-                                completionHandler(.failure(error))
+                            case .success: break
+                            case .timedOut: bandwidth = 0
                             }
                         }
                     } catch {
@@ -595,7 +662,7 @@ public class Atomic<T: Sendable>: @unchecked Sendable {
     }
 }
 
-extension CMSampleBuffer: @unchecked Sendable { }
+extension CMSampleBuffer: @unchecked @retroactive Sendable { }
 
 extension Data {
     
@@ -626,10 +693,10 @@ extension Data {
         return data
     }
     
-    func bytes() -> [UInt8] {
-        var bytes = [UInt8](repeating: 0, count: count)
-        copyBytes(to: &bytes, count: count)
-        return bytes
+    func copyBytesToPointer() -> UnsafeMutableBufferPointer<UInt8> {
+        let pointer = UnsafeMutableBufferPointer<UInt8>.allocate(capacity: count)
+        _ = copyBytes(to: pointer)
+        return pointer
     }
     
     subscript(in range: Range<Index>) -> Self {

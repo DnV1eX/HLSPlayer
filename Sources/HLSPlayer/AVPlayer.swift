@@ -10,6 +10,7 @@ import UIKit
 #endif
 import AVFoundation
 
+/// AVPlayer wrapper with Player protocol conformance.
 final class AVPlayer: NSObject, @preconcurrency Player, @unchecked Sendable {
     
     private let player = AVFoundation.AVPlayer(playerItem: nil)
@@ -136,7 +137,7 @@ final class AVPlayer: NSObject, @preconcurrency Player, @unchecked Sendable {
 
     var currentItem: AVPlayerItem? {
         didSet {
-            if let item = oldValue {
+            if let item = oldValue?.item {
                 item.removeObserver(self, forKeyPath: "playbackBufferEmpty")
                 item.removeObserver(self, forKeyPath: "playbackBufferFull")
                 item.removeObserver(self, forKeyPath: "playbackLikelyToKeepUp")
@@ -164,7 +165,7 @@ final class AVPlayer: NSObject, @preconcurrency Player, @unchecked Sendable {
                 NotificationCenter.default.removeObserver(itemErrorObserver)
             }
                         
-            if let currentItem {
+            if let currentItem = currentItem?.item {
                 itemDidPlayToEndTimeObserver = NotificationCenter.default.addObserver(forName: NSNotification.Name.AVPlayerItemDidPlayToEndTime, object: currentItem, queue: nil) { [weak self] _ in
                     self?.itemDidPlayToEndTime?()
                 }
@@ -175,13 +176,13 @@ final class AVPlayer: NSObject, @preconcurrency Player, @unchecked Sendable {
                     #endif
                 }
 
-                itemFailureObserver = NotificationCenter.default.addObserver(forName: AVPlayerItem.failedToPlayToEndTimeNotification, object: currentItem, queue: .main) { notification in
+                itemFailureObserver = NotificationCenter.default.addObserver(forName: AVFoundation.AVPlayerItem.failedToPlayToEndTimeNotification, object: currentItem, queue: .main) { notification in
                     #if DEBUG
                     print("Player Error: \(notification.description)")
                     #endif
                 }
                 
-                itemErrorObserver = NotificationCenter.default.addObserver(forName: AVPlayerItem.newErrorLogEntryNotification, object: currentItem, queue: .main) { [weak item = currentItem] _ in
+                itemErrorObserver = NotificationCenter.default.addObserver(forName: AVFoundation.AVPlayerItem.newErrorLogEntryNotification, object: currentItem, queue: .main) { [weak item = currentItem] _ in
                     let event = item?.errorLog()?.events.last
                     if let event {
                         #if DEBUG
@@ -197,7 +198,7 @@ final class AVPlayer: NSObject, @preconcurrency Player, @unchecked Sendable {
 //                currentItem.addObserver(self, forKeyPath: "status", options: .new, context: nil)
             }
             
-            player.replaceCurrentItem(with: currentItem)
+            player.replaceCurrentItem(with: currentItem?.item)
         }
     }
     
@@ -207,9 +208,6 @@ final class AVPlayer: NSObject, @preconcurrency Player, @unchecked Sendable {
             return
         }
         let item = AVPlayerItem(url: url)
-        if #available(iOS 14.0, macOS 11.0, *) {
-            item.startsOnFirstEligibleVariant = true
-        }
         currentItem = item
     }
 
@@ -242,8 +240,36 @@ final class AVPlayer: NSObject, @preconcurrency Player, @unchecked Sendable {
     }
 }
 
-extension AVPlayerItem: @preconcurrency PlayerItem {
-    public var duration: TimeInterval {
+/// AVPlayerItem wrapper with PlayerItem protocol conformance.
+final class AVPlayerItem: PlayerItem {
+    
+    fileprivate let item: AVFoundation.AVPlayerItem
+    
+    init(url: URL) {
+        item = .init(url: url)
+        if #available(iOS 14.0, macOS 11.0, *) {
+            item.startsOnFirstEligibleVariant = true
+        }
+    }
+    
+    var preferredPeakBitRate: Double {
+        get {
+            item.preferredPeakBitRate
+        }
+        set {
+            item.preferredPeakBitRate = newValue
+        }
+    }
+    
+    var presentationSize: CGSize {
+        item.presentationSize
+    }
+    
+    var duration: TimeInterval {
+        item.duration.seconds
+    }
+    
+    var bitRate: Double {
         0
     }
 }

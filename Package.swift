@@ -5,6 +5,10 @@ import PackageDescription
 
 let package = Package(
     name: "HLSPlayer",
+//    platforms: [
+//        .iOS(.v12),
+//        .macOS(.v10_14),
+//    ],
     products: [
         // Products define the executables and libraries a package produces, making them visible to other packages.
         .library(
